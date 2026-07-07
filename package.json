@@ -1,17 +1,19 @@
 {
-  "name": "webapp",
+  "name": "teca-proxy-worker",
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "dev:sandbox": "wrangler pages dev dist --ip 0.0.0.0 --port 3000",
     "build": "vite build",
-    "preview": "wrangler pages dev",
-    "deploy": "npm run build && wrangler pages deploy",
+    "preview": "wrangler pages dev dist",
+    "deploy": "npm run build && wrangler pages deploy dist",
     "cf-typegen": "wrangler types --env-interface CloudflareBindings"
   },
   "dependencies": {
     "hono": "^4.12.27"
   },
   "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260702.1",
     "@hono/vite-build": "^1.2.0",
     "@hono/vite-dev-server": "^0.25.2",
     "vite": "^6.3.5",
