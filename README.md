@@ -149,5 +149,7 @@ npm run deploy         # Build + deploy a Cloudflare Pages
 ## Despliegue
 
 - **Plataforma**: Cloudflare Pages
-- **Estado**: ✅ Build exitoso — listo para deploy
-- **Última actualización**: 2026-07-07
+- **URL Producción**: https://teca-proxy-worker.pages.dev
+- **URL de deploy**: https://fa2ec973.teca-proxy-worker.pages.dev
+- **Estado**: ✅ En producción
+- **Última actualización**: 2026-07-09
