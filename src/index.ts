@@ -517,12 +517,30 @@ function shiftDays(date: Date, days: number): Date {
 // HELPERS DE RESPUESTA
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** Cabeceras CORS permisivas requeridas */
+/**
+ * Origen exacto del frontend autorizado.
+ * Con credentials:true el navegador exige un origen explícito,
+ * nunca un wildcard «*».
+ */
+const ALLOWED_ORIGIN = 'https://asocie.pages.dev';
+
+/**
+ * Cabeceras CORS que se inyectan en TODAS las respuestas
+ * (200, 4xx, 5xx y preflight OPTIONS).
+ *
+ * Reglas clave:
+ *  - Allow-Origin: origen exacto del frontend (no «*»)
+ *  - Allow-Credentials: true  → el navegador enviará cookies cross-origin
+ *  - Vary: Origin            → CDN/caché no reutiliza la respuesta para
+ *                              otros orígenes
+ */
 const CORS_HEADERS: Record<string, string> = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-  'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Requested-With',
-  'Access-Control-Max-Age': '86400',
+  'Access-Control-Allow-Origin':      ALLOWED_ORIGIN,
+  'Access-Control-Allow-Credentials': 'true',
+  'Access-Control-Allow-Methods':     'GET, POST, OPTIONS',
+  'Access-Control-Allow-Headers':     'Content-Type, Authorization, X-Requested-With',
+  'Access-Control-Max-Age':           '86400',
+  'Vary':                             'Origin',
 };
 
 /**
