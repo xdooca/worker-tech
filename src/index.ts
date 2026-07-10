@@ -5,7 +5,7 @@
  * Funcionalidad principal:
  *  - Proxy inverso hacia api-service.teca.pe para eludir CORS
  *  - Gestión de sesión de pares (codigo, token) vía cookie Base64
- *  - Paginación de resultados locales (>10 elementos → páginas)
+ *  - Paginación de resultados locales (>3 elementos → páginas)
  *  - Desplazamiento automático hacia atrás en el tiempo cuando
  *    se agotan los registros del rango actual
  *  - Condición de parada cuando la API remota devuelve vacío
@@ -73,7 +73,7 @@ interface PaginationState {
 // CONSTANTES
 // ─────────────────────────────────────────────────────────────────────────────
 
-const PAGE_SIZE = 10;              // Elementos por página entregados al cliente
+const PAGE_SIZE = 3;               // Elementos por página entregados al cliente (Reducido a 3)
 const COOKIE_NAME = 'teca_pgstate'; // Nombre de la cookie de estado
 const API_BASE = 'https://api-service.teca.pe/v1.0/devices';
 const FETCH_TIMEOUT_MS = 15_000;   // Timeout para llamadas a la API externa
@@ -86,7 +86,7 @@ const INITIAL_WINDOW_DAYS = 2;
 
 /**
  * MAX_BACKFILL_ITERATIONS — Límite de seguridad del bucle interno.
- * Si tras N retrocesos de un día no se acumulan ≥10 registros,
+ * Si tras N retrocesos de un día no se acumulan ≥3 registros,
  * el Worker entrega lo que tenga y para, evitando superar el
  * límite de CPU de Cloudflare Workers (~30 ms en plan Free).
  */
@@ -117,7 +117,7 @@ async function handleQuery(request: Request): Promise<Response> {
     /**
      * El cliente envía nuevos pares → iniciar o refrescar la sesión.
      * Ventana inicial: end = hoy, init = hoy - INITIAL_WINDOW_DAYS (2 días).
-     * Luego el bucle de backfill acumula hasta ≥10 registros.
+     * Luego el bucle de backfill acumula hasta ≥3 registros.
      */
     const today = formatDate(new Date());
     const initDay = formatDate(shiftDays(new Date(), -INITIAL_WINDOW_DAYS));
@@ -132,7 +132,7 @@ async function handleQuery(request: Request): Promise<Response> {
       exhausted: false,
     };
 
-    // Cargar el primer lote con backfill automático hasta ≥10 registros
+    // Cargar el primer lote con backfill automático hasta ≥3 registros
     state = await fillBufferWithBackfill(state);
   } else if (existingState) {
     /**
@@ -183,7 +183,7 @@ async function handleQuery(request: Request): Promise<Response> {
  *     siguiente página directamente sin llamar a la API.
  *  2. Si el buffer se agotó y la API no está exhausted → invoca
  *     fillBufferWithBackfill para retroceder en el tiempo acumulando
- *     ≥10 registros (con límite de MAX_BACKFILL_ITERATIONS intentos).
+ *     ≥3 registros (con límite de MAX_BACKFILL_ITERATIONS intentos).
  *  3. Si la API ya estaba exhausted → devuelve página vacía + hasMore:false.
  */
 async function getNextPage(
@@ -210,7 +210,7 @@ async function getNextPage(
   /**
    * Caso 3: buffer vacío pero quedan días por explorar.
    * Retrocedemos el rango UN DÍA antes del init actual y
-   * lanzamos el bucle de backfill para acumular ≥10 registros.
+   * lanzamos el bucle de backfill para acumular ≥3 registros.
    */
   const prevEnd  = parseDate(current.currentInit);
   const prevInit = shiftDays(prevEnd, -1);
@@ -312,36 +312,6 @@ async function fillBufferWithBackfill(state: PaginationState): Promise<Paginatio
     buffer:       accumulated,
     bufferOffset: 0,
     exhausted:    reachedEmpty || (accumulated.length === 0),
-  };
-}
-
-/**
- * fillBuffer — Versión simple sin backfill: una sola consulta al rango dado.
- * Usada internamente cuando ya sabemos el rango exacto a consultar.
- * @deprecated Usa fillBufferWithBackfill para nuevas llamadas.
- */
-async function fillBuffer(state: PaginationState): Promise<PaginationState> {
-  const allRecords: Record<string, unknown>[] = [];
-
-  for (const pair of state.pairs) {
-    try {
-      const records = await fetchFromAPI(
-        pair.codigo,
-        pair.token,
-        state.currentInit,
-        state.currentEnd
-      );
-      allRecords.push(...records);
-    } catch (err: unknown) {
-      console.error(`Error obteniendo datos para codigo=${pair.codigo}:`, err);
-    }
-  }
-
-  return {
-    ...state,
-    buffer:       allRecords,
-    bufferOffset: 0,
-    exhausted:    allRecords.length === 0,
   };
 }
 
@@ -626,8 +596,8 @@ const ALLOWED_ORIGIN = 'https://asocie.pages.dev';
  * Reglas clave:
  *  - Allow-Origin: origen exacto del frontend (no «*»)
  *  - Allow-Credentials: true  → el navegador enviará cookies cross-origin
- *  - Vary: Origin            → CDN/caché no reutiliza la respuesta para
- *                              otros orígenes
+ *  - Vary: Origin             → CDN/caché no reutiliza la respuesta para
+ *                               otros orígenes
  */
 const CORS_HEADERS: Record<string, string> = {
   'Access-Control-Allow-Origin':      ALLOWED_ORIGIN,
