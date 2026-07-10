@@ -73,10 +73,24 @@ interface PaginationState {
 // CONSTANTES
 // ─────────────────────────────────────────────────────────────────────────────
 
-const PAGE_SIZE = 10;           // Elementos por página entregados al cliente
+const PAGE_SIZE = 10;              // Elementos por página entregados al cliente
 const COOKIE_NAME = 'teca_pgstate'; // Nombre de la cookie de estado
 const API_BASE = 'https://api-service.teca.pe/v1.0/devices';
-const FETCH_TIMEOUT_MS = 15_000; // Timeout para llamadas a la API externa
+const FETCH_TIMEOUT_MS = 15_000;   // Timeout para llamadas a la API externa
+
+/**
+ * INITIAL_WINDOW_DAYS — Ventana de días hacia atrás para la primera consulta.
+ * La primera petición siempre arranca con end=hoy e init=hoy-2.
+ */
+const INITIAL_WINDOW_DAYS = 2;
+
+/**
+ * MAX_BACKFILL_ITERATIONS — Límite de seguridad del bucle interno.
+ * Si tras N retrocesos de un día no se acumulan ≥10 registros,
+ * el Worker entrega lo que tenga y para, evitando superar el
+ * límite de CPU de Cloudflare Workers (~30 ms en plan Free).
+ */
+const MAX_BACKFILL_ITERATIONS = 5;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MANEJADOR PRINCIPAL
@@ -102,23 +116,24 @@ async function handleQuery(request: Request): Promise<Response> {
   if (incoming.length > 0) {
     /**
      * El cliente envía nuevos pares → iniciar o refrescar la sesión.
-     * Siempre arrancamos con end=hoy, init=ayer.
+     * Ventana inicial: end = hoy, init = hoy - INITIAL_WINDOW_DAYS (2 días).
+     * Luego el bucle de backfill acumula hasta ≥10 registros.
      */
     const today = formatDate(new Date());
-    const yesterday = formatDate(shiftDays(new Date(), -1));
+    const initDay = formatDate(shiftDays(new Date(), -INITIAL_WINDOW_DAYS));
 
     state = {
       pairs: incoming,
       pairIndex: 0,
-      currentInit: yesterday,
+      currentInit: initDay,
       currentEnd: today,
       buffer: [],
       bufferOffset: 0,
       exhausted: false,
     };
 
-    // Cargar el primer lote desde la API externa
-    state = await fillBuffer(state);
+    // Cargar el primer lote con backfill automático hasta ≥10 registros
+    state = await fillBufferWithBackfill(state);
   } else if (existingState) {
     /**
      * No llegan pares nuevos → continuación de paginación.
@@ -163,9 +178,13 @@ async function handleQuery(request: Request): Promise<Response> {
 /**
  * getNextPage — Extrae una página del buffer y avanza el estado.
  *
- * Si el buffer está vacío (o totalmente consumido) y la API aún no
- * está agotada, desplaza el rango un día más atrás y vuelve a llenar.
- * Repite hasta tener datos o confirmar que no hay más.
+ * Flujo:
+ *  1. Si el buffer local aún tiene registros no entregados → sirve la
+ *     siguiente página directamente sin llamar a la API.
+ *  2. Si el buffer se agotó y la API no está exhausted → invoca
+ *     fillBufferWithBackfill para retroceder en el tiempo acumulando
+ *     ≥10 registros (con límite de MAX_BACKFILL_ITERATIONS intentos).
+ *  3. Si la API ya estaba exhausted → devuelve página vacía + hasMore:false.
  */
 async function getNextPage(
   state: PaginationState
@@ -173,7 +192,7 @@ async function getNextPage(
 
   let current = { ...state };
 
-  // Intentar servir desde el buffer existente
+  // ── Caso 1: buffer local con datos pendientes ─────────────
   if (current.bufferOffset < current.buffer.length) {
     const page = current.buffer.slice(
       current.bufferOffset,
@@ -183,29 +202,29 @@ async function getNextPage(
     return { page, newState: current };
   }
 
-  // Buffer consumido: si ya estaba agotado, no hay más datos
+  // ── Caso 2: buffer consumido y API ya agotada ────────────
   if (current.exhausted) {
     return { page: [], newState: current };
   }
 
   /**
-   * Desplazamiento hacia atrás: mover el rango UN DÍA más antiguo.
-   * El nuevo end es el init anterior; el nuevo init es un día antes.
+   * Caso 3: buffer vacío pero quedan días por explorar.
+   * Retrocedemos el rango UN DÍA antes del init actual y
+   * lanzamos el bucle de backfill para acumular ≥10 registros.
    */
-  const prevEnd = parseDate(current.currentInit);
+  const prevEnd  = parseDate(current.currentInit);
   const prevInit = shiftDays(prevEnd, -1);
 
   current = {
     ...current,
-    currentEnd: formatDate(prevEnd),
-    currentInit: formatDate(prevInit),
-    buffer: [],
+    currentEnd:   formatDate(prevEnd),
+    currentInit:  formatDate(prevInit),
+    buffer:       [],
     bufferOffset: 0,
   };
 
-  current = await fillBuffer(current);
+  current = await fillBufferWithBackfill(current);
 
-  // Verificar de nuevo si hay datos tras el refill
   if (current.buffer.length === 0) {
     current.exhausted = true;
     return { page: [], newState: current };
@@ -217,12 +236,89 @@ async function getNextPage(
 }
 
 /**
- * fillBuffer — Consulta la API externa para el rango de fechas actual
- * y llena el buffer del estado.
+ * fillBufferWithBackfill — Bucle interno que acumula registros retrocediendo
+ * día a día hasta alcanzar el mínimo PAGE_SIZE o agotar MAX_BACKFILL_ITERATIONS.
  *
- * Itera sobre todos los pares (codigo, token) almacenados en la sesión.
- * Los resultados de todos los pares se concatenan en el buffer.
- * Si todos devuelven vacío → marca exhausted = true.
+ * Algoritmo:
+ *  - Consulta todos los pares (codigo+token) para el rango currentInit→currentEnd.
+ *  - Acumula los resultados en un array local.
+ *  - Si el acumulado es < PAGE_SIZE Y quedan iteraciones disponibles:
+ *      · Retrocede currentInit un día más (currentEnd queda fijo en su valor actual).
+ *      · Repite la consulta y acumula sobre lo ya obtenido.
+ *  - Al salir del bucle (por ≥PAGE_SIZE registros o por límite de iteraciones):
+ *      · Vuelca el acumulado al buffer del estado.
+ *      · Si el acumulado era 0 → marca exhausted=true.
+ *
+ * Límite de seguridad: MAX_BACKFILL_ITERATIONS (5) evita que el Worker
+ * supere el límite de CPU de Cloudflare (~30 ms en plan Free, ~50 ms en Paid).
+ */
+async function fillBufferWithBackfill(state: PaginationState): Promise<PaginationState> {
+  let accumulated: Record<string, unknown>[] = [];
+  let currentInit = state.currentInit;
+  const currentEnd  = state.currentEnd;   // el extremo superior no cambia en el backfill
+  let iterations    = 0;
+  let reachedEmpty  = false;
+
+  while (accumulated.length < PAGE_SIZE && iterations < MAX_BACKFILL_ITERATIONS) {
+    iterations++;
+
+    // ── Consultar todos los pares para el rango actual ──────
+    const batchRecords: Record<string, unknown>[] = [];
+    for (const pair of state.pairs) {
+      try {
+        const records = await fetchFromAPI(
+          pair.codigo,
+          pair.token,
+          currentInit,
+          currentEnd
+        );
+        batchRecords.push(...records);
+      } catch (err: unknown) {
+        console.error(
+          `[backfill iter=${iterations}] Error para codigo=${pair.codigo}:`, err
+        );
+      }
+    }
+
+    accumulated.push(...batchRecords);
+
+    // ── Condición de parada: API devuelve vacío en este rango
+    if (batchRecords.length === 0 && accumulated.length === 0) {
+      // Si ya en la primera iteración no hay nada, probamos retroceder.
+      // Si tras MAX_BACKFILL_ITERATIONS sigue vacío → exhausted.
+      if (iterations >= MAX_BACKFILL_ITERATIONS) {
+        reachedEmpty = true;
+        break;
+      }
+    }
+
+    // ── Si ya tenemos suficientes, salimos del bucle ─────────
+    if (accumulated.length >= PAGE_SIZE) break;
+
+    // ── Retroceder un día extra para la siguiente iteración ──
+    const nextEnd  = parseDate(currentInit);
+    const nextInit = shiftDays(nextEnd, -1);
+    currentInit    = formatDate(nextInit);
+
+    // Si el rango sería anterior a una fecha razonablemente antigua
+    // (protección extra), se puede añadir una guardia aquí en el futuro.
+  }
+
+  // Actualizar el estado con el init más antiguo alcanzado y el buffer acumulado
+  return {
+    ...state,
+    currentInit:  currentInit,
+    currentEnd:   currentEnd,
+    buffer:       accumulated,
+    bufferOffset: 0,
+    exhausted:    reachedEmpty || (accumulated.length === 0),
+  };
+}
+
+/**
+ * fillBuffer — Versión simple sin backfill: una sola consulta al rango dado.
+ * Usada internamente cuando ya sabemos el rango exacto a consultar.
+ * @deprecated Usa fillBufferWithBackfill para nuevas llamadas.
  */
 async function fillBuffer(state: PaginationState): Promise<PaginationState> {
   const allRecords: Record<string, unknown>[] = [];
@@ -237,16 +333,15 @@ async function fillBuffer(state: PaginationState): Promise<PaginationState> {
       );
       allRecords.push(...records);
     } catch (err: unknown) {
-      // Un fallo en un par no debe tumbar toda la respuesta; se registra y continúa
       console.error(`Error obteniendo datos para codigo=${pair.codigo}:`, err);
     }
   }
 
   return {
     ...state,
-    buffer: allRecords,
+    buffer:       allRecords,
     bufferOffset: 0,
-    exhausted: allRecords.length === 0,
+    exhausted:    allRecords.length === 0,
   };
 }
 
