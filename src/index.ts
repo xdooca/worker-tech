@@ -4,13 +4,13 @@
  * ============================================================
  * Funcionalidad principal:
  *  - Proxy inverso hacia api-service.teca.pe para eludir CORS
- *  - Gestión de sesión híbrida (Cookie, Cabecera X-Pagination-State o Body/Query Param)
- *  - Paginación robusta local de 5 elementos para evitar Timeouts
- *  - Desplazamiento automático hacia atrás en el tiempo con retroceso incremental
+ *  - Gestión de sesión de pares (codigo, token) vía cookie Base64
+ *  - Paginación de resultados locales (>3 elementos → páginas)
+ *  - Desplazamiento automático hacia atrás en el tiempo cuando
+ *    se agotan los registros del rango actual
  *  - Condición de parada cuando la API remota devuelve vacío
  * ============================================================
  */
-
 
 export default {
   async fetch(request: Request, env: unknown, ctx: ExecutionContext): Promise<Response> {
@@ -41,18 +41,31 @@ export default {
 // TIPOS
 // ─────────────────────────────────────────────────────────────────────────────
 
+/** Un par de credenciales: código de dispositivo + token de acceso */
 interface DevicePair {
   codigo: string;
   token: string;
 }
 
+/**
+ * Estado de paginación almacenado en la cookie del cliente.
+ * Se serializa/deserializa en Base64+JSON para mantener el estado
+ * entre llamadas sin consumir KV ni memoria del Worker.
+ */
 interface PaginationState {
+  /** Lista de pares (codigo, token) aportados por el cliente */
   pairs: DevicePair[];
+  /** Índice del par actualmente en consulta */
   pairIndex: number;
+  /** Fecha de inicio del rango actual (YYYY-MM-DD) */
   currentInit: string;
+  /** Fecha de fin del rango actual (YYYY-MM-DD) */
   currentEnd: string;
+  /** Buffer de registros ya obtenidos pero aún no entregados */
   buffer: Record<string, unknown>[];
+  /** Offset dentro del buffer para la página actual */
   bufferOffset: number;
+  /** Indica si la API remota ya devolvió vacío (sin más datos) */
   exhausted: boolean;
 }
 
@@ -60,54 +73,57 @@ interface PaginationState {
 // CONSTANTES
 // ─────────────────────────────────────────────────────────────────────────────
 
-
-const PAGE_SIZE = 5;               // Reducido a 5 elementos para prevenir límites de CPU
-const COOKIE_NAME = 'teca_pgstate'; // Nombre de la cookie de respaldo
+const PAGE_SIZE = 3;               // Elementos por página entregados al cliente (Reducido a 3)
+const COOKIE_NAME = 'teca_pgstate'; // Nombre de la cookie de estado
 const API_BASE = 'https://api-service.teca.pe/v1.0/devices';
-const FETCH_TIMEOUT_MS = 15_000;   // Timeout de red
+const FETCH_TIMEOUT_MS = 15_000;   // Timeout para llamadas a la API externa
 
-const INITIAL_WINDOW_DAYS = 2;     // Ventana inicial de 2 días
-const MAX_BACKFILL_ITERATIONS = 5; // Límite de retrocesos para no colapsar la CPU
+/**
+ * INITIAL_WINDOW_DAYS — Ventana de días hacia atrás para la primera consulta.
+ * La primera petición siempre arranca con end=hoy e init=hoy-2.
+ */
+const INITIAL_WINDOW_DAYS = 2;
+
+/**
+ * MAX_BACKFILL_ITERATIONS — Límite de seguridad del bucle interno.
+ * Si tras N retrocesos de un día no se acumulan ≥3 registros,
+ * el Worker entrega lo que tenga y para, evitando superar el
+ * límite de CPU de Cloudflare Workers (~30 ms en plan Free).
+ */
+const MAX_BACKFILL_ITERATIONS = 5;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MANEJADOR PRINCIPAL
 // ─────────────────────────────────────────────────────────────────────────────
 
-
+/**
+ * handleQuery — Punto de entrada para GET /api/query y POST /api/query
+ *
+ * Flujo:
+ *  1. Leer parámetros `codigo` y `token` de la petición (GET query string o POST body)
+ *  2. Decidir si es una sesión nueva o continuación de una existente (via cookie)
+ *  3. Intentar servir desde el buffer local; si se agota, pedir al rango
+ *     siguiente (un día más atrás) o devolver hasMore:false
+ *  4. Devolver la página con la cookie actualizada
+ */
 async function handleQuery(request: Request): Promise<Response> {
-  // Extraemos los parámetros de forma unificada (POST/GET) y posibles estados
-  const payload = await parseRequestPayload(request);
+  // ── 1. Extraer parámetros de la petición ──────────────────
+  const incoming = await extractParams(request);
+  const existingState = readStateFromCookie(request);
 
-  // Intentamos leer el estado de sesión de 3 fuentes para máxima resiliencia:
-  // 1. Cabecera personalizada 'X-Pagination-State' (Ideal para bypass de bloqueo de cookies)
-  // 2. Parámetro explícito 'state' o 'cursor' (enviado por Body o Query string)
-  // 3. Cookies tradicionales (como respaldo)
-  let state: PaginationState | null = null;
+  let state: PaginationState;
 
-  const headerState = request.headers.get('X-Pagination-State');
-  if (headerState) {
-    state = decodeState(headerState);
-  }
-
-  if (!state && payload.stateStr) {
-    state = decodeState(payload.stateStr);
-  }
-
-  if (!state) {
-    state = readStateFromCookie(request);
-  }
-
-  let activeState: PaginationState;
-
-  if (payload.pairs.length > 0 && !state) {
+  if (incoming.length > 0) {
     /**
-     * Iniciar nueva sesión con credenciales provistas por el cliente
+     * El cliente envía nuevos pares → iniciar o refrescar la sesión.
+     * Ventana inicial: end = hoy, init = hoy - INITIAL_WINDOW_DAYS (2 días).
+     * Luego el bucle de backfill acumula hasta ≥3 registros.
      */
     const today = formatDate(new Date());
     const initDay = formatDate(shiftDays(new Date(), -INITIAL_WINDOW_DAYS));
 
-    activeState = {
-      pairs: payload.pairs,
+    state = {
+      pairs: incoming,
       pairIndex: 0,
       currentInit: initDay,
       currentEnd: today,
@@ -116,22 +132,25 @@ async function handleQuery(request: Request): Promise<Response> {
       exhausted: false,
     };
 
-    activeState = await fillBufferWithBackfill(activeState);
-  } else if (state) {
+    // Cargar el primer lote con backfill automático hasta ≥3 registros
+    state = await fillBufferWithBackfill(state);
+  } else if (existingState) {
     /**
-     * Continuación de sesión
+     * No llegan pares nuevos → continuación de paginación.
+     * Usamos el estado almacenado en la cookie.
      */
-    activeState = state;
+    state = existingState;
   } else {
+    // Sin estado previo ni parámetros nuevos
     return corsResponse(
-      jsonError(400, 'Se requieren los parámetros "codigo" y "token", o un "X-Pagination-State" / "state" válido.')
+      jsonError(400, 'Se requieren los parámetros "codigo" y "token".')
     );
   }
 
-  // ── 2. Obtener la página de resultados actual ─────────────
-  const { page, newState } = await getNextPage(activeState);
+  // ── 2. Obtener la página actual ───────────────────────────
+  const { page, newState } = await getNextPage(state);
 
-  // ── 3. Construir respuesta con estado serializado ─────────
+  // ── 3. Construir respuesta con cookie actualizada ─────────
   const cookieValue = encodeState(newState);
   const responseBody = {
     data: page,
@@ -142,8 +161,6 @@ async function handleQuery(request: Request): Promise<Response> {
       end: newState.currentEnd,
     },
     pageSize: PAGE_SIZE,
-    // Devolvemos el estado en el Body para que el frontend pueda persistirlo localmente
-    state: cookieValue, 
   };
 
   const response = new Response(JSON.stringify(responseBody), {
@@ -158,13 +175,24 @@ async function handleQuery(request: Request): Promise<Response> {
 // LÓGICA DE PAGINACIÓN
 // ─────────────────────────────────────────────────────────────────────────────
 
-
+/**
+ * getNextPage — Extrae una página del buffer y avanza el estado.
+ *
+ * Flujo:
+ *  1. Si el buffer local aún tiene registros no entregados → sirve la
+ *     siguiente página directamente sin llamar a la API.
+ *  2. Si el buffer se agotó y la API no está exhausted → invoca
+ *     fillBufferWithBackfill para retroceder en el tiempo acumulando
+ *     ≥3 registros (con límite de MAX_BACKFILL_ITERATIONS intentos).
+ *  3. Si la API ya estaba exhausted → devuelve página vacía + hasMore:false.
+ */
 async function getNextPage(
   state: PaginationState
 ): Promise<{ page: Record<string, unknown>[]; newState: PaginationState }> {
 
   let current = { ...state };
 
+  // ── Caso 1: buffer local con datos pendientes ─────────────
   if (current.bufferOffset < current.buffer.length) {
     const page = current.buffer.slice(
       current.bufferOffset,
@@ -174,10 +202,16 @@ async function getNextPage(
     return { page, newState: current };
   }
 
+  // ── Caso 2: buffer consumido y API ya agotada ────────────
   if (current.exhausted) {
     return { page: [], newState: current };
   }
 
+  /**
+   * Caso 3: buffer vacío pero quedan días por explorar.
+   * Retrocedemos el rango UN DÍA antes del init actual y
+   * lanzamos el bucle de backfill para acumular ≥3 registros.
+   */
   const prevEnd  = parseDate(current.currentInit);
   const prevInit = shiftDays(prevEnd, -1);
 
@@ -201,17 +235,34 @@ async function getNextPage(
   return { page, newState: current };
 }
 
-
+/**
+ * fillBufferWithBackfill — Bucle interno que acumula registros retrocediendo
+ * día a día hasta alcanzar el mínimo PAGE_SIZE o agotar MAX_BACKFILL_ITERATIONS.
+ *
+ * Algoritmo:
+ *  - Consulta todos los pares (codigo+token) para el rango currentInit→currentEnd.
+ *  - Acumula los resultados en un array local.
+ *  - Si el acumulado es < PAGE_SIZE Y quedan iteraciones disponibles:
+ *      · Retrocede currentInit un día más (currentEnd queda fijo en su valor actual).
+ *      · Repite la consulta y acumula sobre lo ya obtenido.
+ *  - Al salir del bucle (por ≥PAGE_SIZE registros o por límite de iteraciones):
+ *      · Vuelca el acumulado al buffer del estado.
+ *      · Si el acumulado era 0 → marca exhausted=true.
+ *
+ * Límite de seguridad: MAX_BACKFILL_ITERATIONS (5) evita que el Worker
+ * supere el límite de CPU de Cloudflare (~30 ms en plan Free, ~50 ms en Paid).
+ */
 async function fillBufferWithBackfill(state: PaginationState): Promise<PaginationState> {
   let accumulated: Record<string, unknown>[] = [];
   let currentInit = state.currentInit;
-  const currentEnd  = state.currentEnd;
+  const currentEnd  = state.currentEnd;   // el extremo superior no cambia en el backfill
   let iterations    = 0;
   let reachedEmpty  = false;
 
   while (accumulated.length < PAGE_SIZE && iterations < MAX_BACKFILL_ITERATIONS) {
     iterations++;
 
+    // ── Consultar todos los pares para el rango actual ──────
     const batchRecords: Record<string, unknown>[] = [];
     for (const pair of state.pairs) {
       try {
@@ -231,20 +282,29 @@ async function fillBufferWithBackfill(state: PaginationState): Promise<Paginatio
 
     accumulated.push(...batchRecords);
 
+    // ── Condición de parada: API devuelve vacío en este rango
     if (batchRecords.length === 0 && accumulated.length === 0) {
+      // Si ya en la primera iteración no hay nada, probamos retroceder.
+      // Si tras MAX_BACKFILL_ITERATIONS sigue vacío → exhausted.
       if (iterations >= MAX_BACKFILL_ITERATIONS) {
         reachedEmpty = true;
         break;
       }
     }
 
+    // ── Si ya tenemos suficientes, salimos del bucle ─────────
     if (accumulated.length >= PAGE_SIZE) break;
 
+    // ── Retroceder un día extra para la siguiente iteración ──
     const nextEnd  = parseDate(currentInit);
     const nextInit = shiftDays(nextEnd, -1);
     currentInit    = formatDate(nextInit);
+
+    // Si el rango sería anterior a una fecha razonablemente antigua
+    // (protección extra), se puede añadir una guardia aquí en el futuro.
   }
 
+  // Actualizar el estado con el init más antiguo alcanzado y el buffer acumulado
   return {
     ...state,
     currentInit:  currentInit,
@@ -259,7 +319,16 @@ async function fillBufferWithBackfill(state: PaginationState): Promise<Paginatio
 // LLAMADA A LA API EXTERNA
 // ─────────────────────────────────────────────────────────────────────────────
 
-
+/**
+ * fetchFromAPI — Realiza el fetch real a api-service.teca.pe
+ * con el formato de URL requerido.
+ *
+ * URL: https://api-service.teca.pe/v1.0/devices/{codigo}/report/json
+ *      ?init={fecha_inicio}&end={fecha_fin}&token={token}
+ *
+ * Incluye timeout manual usando AbortController para evitar
+ * que el Worker quede bloqueado ante APIs lentas o caídas.
+ */
 async function fetchFromAPI(
   codigo: string,
   token: string,
@@ -302,6 +371,7 @@ async function fetchFromAPI(
     throw new Error(`La API externa devolvió JSON inválido para codigo=${codigo}`);
   }
 
+  // La API puede devolver un array directamente o un objeto con propiedad "data"
   if (Array.isArray(data)) {
     return data as Record<string, unknown>[];
   }
@@ -315,99 +385,126 @@ async function fetchFromAPI(
     return (data as Record<string, unknown>).data as Record<string, unknown>[];
   }
 
+  // Respuesta vacía o formato inesperado → tratar como vacío
   return [];
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// EXTRACCIÓN DE PARÁMETROS Y PAYLOAD
+// EXTRACCIÓN DE PARÁMETROS
 // ─────────────────────────────────────────────────────────────────────────────
 
-
-interface RequestPayload {
-  pairs: DevicePair[];
-  stateStr?: string;
-}
-
-async function parseRequestPayload(request: Request): Promise<RequestPayload> {
+/**
+ * extractParams — Lee los pares (codigo, token) del request.
+ *
+ * Soporta:
+ *  - GET: ?codigo=X&token=Y  (un solo par)
+ *  - GET: ?codigo=X1&token=Y1&codigo=X2&token=Y2  (múltiples, getAll)
+ *  - POST JSON: { codigo, token } o { pairs: [{codigo, token}, ...] }
+ *  - POST form-data: código y token como campos
+ */
+async function extractParams(request: Request): Promise<DevicePair[]> {
   const url = new URL(request.url);
   const pairs: DevicePair[] = [];
-  let stateStr: string | undefined = url.searchParams.get('state') || url.searchParams.get('cursor') || undefined;
 
-  const codigos = url.searchParams.getAll('codigo');
-  const tokens = url.searchParams.getAll('token');
+  if (request.method === 'GET') {
+    const codigos = url.searchParams.getAll('codigo');
+    const tokens = url.searchParams.getAll('token');
 
-  for (let i = 0; i < Math.min(codigos.length, tokens.length); i++) {
-    if (codigos[i] && tokens[i]) {
-      pairs.push({ codigo: codigos[i].trim(), token: tokens[i].trim() });
+    for (let i = 0; i < Math.min(codigos.length, tokens.length); i++) {
+      if (codigos[i] && tokens[i]) {
+        pairs.push({ codigo: codigos[i].trim(), token: tokens[i].trim() });
+      }
     }
+    return pairs;
   }
 
   if (request.method === 'POST') {
     const contentType = request.headers.get('content-type') ?? '';
 
     if (contentType.includes('application/json')) {
+      let body: unknown;
       try {
-        const body = await request.clone().json() as any;
-        if (body && typeof body === 'object') {
-          if (body.state && typeof body.state === 'string') stateStr = body.state;
-          if (body.cursor && typeof body.cursor === 'string') stateStr = body.cursor;
+        body = await request.json();
+      } catch {
+        return [];
+      }
 
-          if (Array.isArray(body.pairs)) {
-            for (const p of body.pairs) {
-              if (p && typeof p === 'object' && 'codigo' in p && 'token' in p) {
-                pairs.push({
-                  codigo: String(p.codigo).trim(),
-                  token: String(p.token).trim(),
-                });
-              }
-            }
-          } else if ('codigo' in body && 'token' in body) {
+      if (
+        body !== null &&
+        typeof body === 'object' &&
+        'pairs' in (body as object) &&
+        Array.isArray((body as Record<string, unknown>).pairs)
+      ) {
+        // Formato: { pairs: [{codigo, token}, ...] }
+        const rawPairs = (body as Record<string, unknown>).pairs as unknown[];
+        for (const p of rawPairs) {
+          if (
+            p !== null &&
+            typeof p === 'object' &&
+            'codigo' in (p as object) &&
+            'token' in (p as object)
+          ) {
+            const pair = p as Record<string, unknown>;
             pairs.push({
-              codigo: String(body.codigo).trim(),
-              token: String(body.token).trim(),
+              codigo: String(pair.codigo).trim(),
+              token: String(pair.token).trim(),
             });
           }
         }
-      } catch {}
+      } else if (
+        body !== null &&
+        typeof body === 'object' &&
+        'codigo' in (body as object) &&
+        'token' in (body as object)
+      ) {
+        // Formato: { codigo, token }
+        const b = body as Record<string, unknown>;
+        pairs.push({ codigo: String(b.codigo).trim(), token: String(b.token).trim() });
+      }
+
     } else if (
       contentType.includes('application/x-www-form-urlencoded') ||
       contentType.includes('multipart/form-data')
     ) {
-      try {
-        const form = await request.clone().formData();
-        const formState = form.get('state') || form.get('cursor');
-        if (formState && typeof formState === 'string') stateStr = formState;
+      const form = await request.formData();
+      const codigos = form.getAll('codigo') as string[];
+      const tokens = form.getAll('token') as string[];
 
-        const formCodigos = form.getAll('codigo') as string[];
-        const formTokens = form.getAll('token') as string[];
-
-        for (let i = 0; i < Math.min(formCodigos.length, formTokens.length); i++) {
-          if (formCodigos[i] && formTokens[i]) {
-            pairs.push({ codigo: formCodigos[i].trim(), token: formTokens[i].trim() });
-          }
+      for (let i = 0; i < Math.min(codigos.length, tokens.length); i++) {
+        if (codigos[i] && tokens[i]) {
+          pairs.push({ codigo: codigos[i].trim(), token: tokens[i].trim() });
         }
-      } catch {}
+      }
     }
   }
 
-  return { pairs, stateStr };
+  return pairs;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MANEJO DE ESTADO
+// MANEJO DE ESTADO EN COOKIE (Base64 + JSON)
 // ─────────────────────────────────────────────────────────────────────────────
 
-
+/**
+ * encodeState — Serializa el estado de paginación a Base64.
+ * Se almacena en una cookie HttpOnly; Secure; SameSite=None
+ * para permitir peticiones cross-origin desde el frontend web.
+ */
 function encodeState(state: PaginationState): string {
   const json = JSON.stringify(state);
   return btoa(unescape(encodeURIComponent(json)));
 }
 
+/**
+ * decodeState — Deserializa el estado desde Base64.
+ * Devuelve null si el valor es inválido o ha sido manipulado.
+ */
 function decodeState(encoded: string): PaginationState | null {
   try {
     const json = decodeURIComponent(escape(atob(encoded)));
     const parsed = JSON.parse(json) as PaginationState;
 
+    // Validación mínima de integridad
     if (
       !Array.isArray(parsed.pairs) ||
       typeof parsed.currentInit !== 'string' ||
@@ -422,6 +519,10 @@ function decodeState(encoded: string): PaginationState | null {
   }
 }
 
+/**
+ * readStateFromCookie — Extrae y decodifica el estado de paginación
+ * desde la cookie de la petición entrante.
+ */
 function readStateFromCookie(request: Request): PaginationState | null {
   const cookieHeader = request.headers.get('Cookie') ?? '';
   const cookies = parseCookies(cookieHeader);
@@ -430,6 +531,9 @@ function readStateFromCookie(request: Request): PaginationState | null {
   return decodeState(encoded);
 }
 
+/**
+ * parseCookies — Parsea el header Cookie en un objeto clave/valor.
+ */
 function parseCookies(cookieHeader: string): Record<string, string> {
   const result: Record<string, string> = {};
   for (const part of cookieHeader.split(';')) {
@@ -445,7 +549,10 @@ function parseCookies(cookieHeader: string): Record<string, string> {
 // UTILIDADES DE FECHAS
 // ─────────────────────────────────────────────────────────────────────────────
 
-
+/**
+ * formatDate — Convierte un objeto Date a string YYYY-MM-DD
+ * usando UTC para evitar desfases por zona horaria.
+ */
 function formatDate(date: Date): string {
   const y = date.getUTCFullYear();
   const m = String(date.getUTCMonth() + 1).padStart(2, '0');
@@ -453,11 +560,18 @@ function formatDate(date: Date): string {
   return `${y}-${m}-${d}`;
 }
 
+/**
+ * parseDate — Convierte un string YYYY-MM-DD a objeto Date (UTC).
+ */
 function parseDate(dateStr: string): Date {
   const [y, m, d] = dateStr.split('-').map(Number);
   return new Date(Date.UTC(y, m - 1, d));
 }
 
+/**
+ * shiftDays — Devuelve una nueva fecha desplazada N días.
+ * Valores negativos mueven hacia atrás en el tiempo.
+ */
 function shiftDays(date: Date, days: number): Date {
   const result = new Date(date.getTime());
   result.setUTCDate(result.getUTCDate() + days);
@@ -465,22 +579,38 @@ function shiftDays(date: Date, days: number): Date {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// HELPERS DE RESPUESTA Y CORS
+// HELPERS DE RESPUESTA
 // ─────────────────────────────────────────────────────────────────────────────
 
-
+/**
+ * Origen exacto del frontend autorizado.
+ * Con credentials:true el navegador exige un origen explícito,
+ * nunca un wildcard «*».
+ */
 const ALLOWED_ORIGIN = 'https://asocie.pages.dev';
 
-// Importante: Agregamos 'X-Pagination-State' a las cabeceras permitidas por CORS
+/**
+ * Cabeceras CORS que se inyectan en TODAS las respuestas
+ * (200, 4xx, 5xx y preflight OPTIONS).
+ *
+ * Reglas clave:
+ *  - Allow-Origin: origen exacto del frontend (no «*»)
+ *  - Allow-Credentials: true  → el navegador enviará cookies cross-origin
+ *  - Vary: Origin             → CDN/caché no reutiliza la respuesta para
+ *                               otros orígenes
+ */
 const CORS_HEADERS: Record<string, string> = {
   'Access-Control-Allow-Origin':      ALLOWED_ORIGIN,
   'Access-Control-Allow-Credentials': 'true',
   'Access-Control-Allow-Methods':     'GET, POST, OPTIONS',
-  'Access-Control-Allow-Headers':     'Content-Type, Authorization, X-Requested-With, X-Pagination-State',
+  'Access-Control-Allow-Headers':     'Content-Type, Authorization, X-Requested-With',
   'Access-Control-Max-Age':           '86400',
   'Vary':                             'Origin',
 };
 
+/**
+ * corsResponse — Clona una Response inyectando las cabeceras CORS.
+ */
 function corsResponse(response: Response): Response {
   const newHeaders = new Headers(response.headers);
   for (const [key, value] of Object.entries(CORS_HEADERS)) {
@@ -493,6 +623,17 @@ function corsResponse(response: Response): Response {
   });
 }
 
+/**
+ * corsResponseWithCookie — Igual que corsResponse pero además
+ * establece la cookie de estado de paginación.
+ *
+ * Atributos de la cookie:
+ *  - HttpOnly: no accesible desde JS del cliente (seguridad)
+ *  - Secure: sólo sobre HTTPS (obligatorio en producción)
+ *  - SameSite=None: permite envío cross-origin (necesario para el proxy)
+ *  - Path=/: disponible en toda la app
+ *  - Max-Age=86400: expira en 24 horas
+ */
 function corsResponseWithCookie(
   response: Response,
   cookieName: string,
@@ -515,6 +656,9 @@ function corsResponseWithCookie(
   });
 }
 
+/**
+ * jsonError — Crea una Response JSON de error con la estructura estándar.
+ */
 function jsonError(status: number, message: string): Response {
   return new Response(
     JSON.stringify({ error: true, status, message }),
